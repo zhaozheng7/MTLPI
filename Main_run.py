@@ -9,6 +9,8 @@ import keras
 from model import PIModel
 from sklearn.metrics import r2_score
 from Earlystop import EarlyStop
+from SYNTHETICDATA import create_synth_data
+import time
 
 tf.keras.utils.set_random_seed(2)
 tf.config.experimental.enable_op_determinism()
@@ -19,6 +21,9 @@ tf.config.experimental.enable_op_determinism()
 1.QD+无法收敛问题解决
 2.加入CAGrad
 """
+"""
+1.目前存在问题：PICP的指标也在收敛？
+"""
 
 class Run:
     def __init__(self, normal):
@@ -27,10 +32,15 @@ class Run:
         # To keep the results
         self.result = []
         self.opt = tf.keras.optimizers.legacy.Adam()
+
+        self.learning_rate = 0.01
+        self.method = 'normal'
+        self.coverage_rate = 0.95
+        self.current_time = time.strftime("%Y%m%d%H%M%S", time.localtime())
         """
-        这里设置损失函数名称，目前支持QD, QD+, Continuous, Dual, MTLPI
+        这里设置损失函数名称，目前支持:QD, QD+, Continuous, Dual, MTLPI
         """
-        self.loss_name = 'QD+'
+        self.loss_name = 'Dual'
 
     @classmethod
     def set_epochs(cls, epochs):
@@ -41,7 +51,7 @@ class Run:
         cls.batch_size = batch_size
 
     def run_normal(self, file_path):
-        self.normal_model.init_arguments(loss_name=self.loss_name, coverage_rate=0.99, method='CAGrad')
+        self.normal_model.init_arguments(loss_name=self.loss_name, coverage_rate=self.coverage_rate, method=self.method)
         self.normal_model.compile(optimizer=self.opt,
                                   loss=[self.normal_model.selective_up,
                                         self.normal_model.selective_low,
@@ -54,8 +64,8 @@ class Run:
                                            self.normal_model.mse_penalty])
 
         def lr_scheduler(epoch):
-            learning_rate = 0.001
-            lr_drop = 1000
+            learning_rate = self.learning_rate
+            lr_drop = 2000
             return learning_rate * (0.5 ** (epoch // lr_drop))
 
         reduce_lr = keras.callbacks.LearningRateScheduler(lr_scheduler)
@@ -65,7 +75,7 @@ class Run:
                                                                                     self.normal.y_val[:, 1]]),
                                                batch_size=self.batch_size,
                                                epochs=self.epochs,
-                                               callbacks=[reduce_lr, EarlyStop(patience=600)],
+                                               callbacks=[reduce_lr, EarlyStop(patience=1200)],
                                                verbose=1)
         # # Save the training history for analysis
         name = self.normal.dataset.split('.')[0]
@@ -92,9 +102,13 @@ class Run:
         # Save all predicted value
         dataset_name = model.dataset.split('.')[0]
         df.to_csv(os.path.join(file_path, f'{dataset_name}_{name}_pred.csv'), header=True, index=False)
-        self.result.append({'PICP': np.mean(df['PICP']), 'MPIW': np.mean(df['MPIW'])})  # ,'NMPIW':np.mean(df['NMPIW'])
+        self.result.append({'R2': r2_score(model.y_test[:, 2], df['PredPoint']),
+                            'PICP': np.mean(df['PICP']),
+                            'MPIW': np.mean(df['MPIW']),
+                            'MSE': np.mean((df['y_true'] - df['PredPoint']) ** 2)})  # ,'NMPIW':np.mean(df['NMPIW'])
 
     def print_res(self):
+        self.result.append({'lr': self.learning_rate,'learning_decay': 0.1, 'epochs': self.epochs, 'batch_size': self.batch_size,'current time': self.current_time})
         res = pd.DataFrame(self.result)
         print(res)
         return res
@@ -106,10 +120,10 @@ class Run:
         print(f"R2:   {r2:.4f}")
         print(f"RMSE: {rmse:.4f}")
         plt.figure(figsize=(10, 6))
-        plt.plot(model.X_all, model.y_all, 'o', markersize=5, label='TrueData')
-        plt.plot(model.X_test, predictions[:, 0], 'o', markersize=5.5, label='Lowerbound')
-        plt.plot(model.X_test, predictions[:, 1], 'o', markersize=5.5, label='Upperbound')
-        plt.plot(model.X_test, predictions[:, 2], 'o', markersize=5.5, label='PredPoint')
+        plt.plot(model.X_all, model.y_all, 'o', markersize=1, label='TrueData')
+        plt.plot(model.X_test, predictions[:, 0], 'o', markersize=1, label='Lowerbound')
+        plt.plot(model.X_test, predictions[:, 1], 'o', markersize=1, label='Upperbound')
+        plt.plot(model.X_test, predictions[:, 2], 'o', markersize=1, label='PredPoint')
         plt.xlabel('x')
         plt.ylabel('y')
         plt.title(f'{name}_{cver}_{loss}_{r2:.4f}_{rmse:.4f}')
@@ -121,8 +135,8 @@ class Run:
         dict_data = pd.read_pickle(filename)
         df = pd.DataFrame(dict_data)
         plt.figure(figsize=(10, 6))
-        plt.ylim(0, 5)
-        sns.set_style("ticks")
+        plt.ylim(0, 1.2)
+        sns.set_style("white")
         plt.title(name)
         plt.xlabel("Epochs")
         sns.lineplot(
@@ -159,12 +173,16 @@ def main():
     """
     using paper data 重要，这里设置数据集和目标值
     """
-    dataset = ['101_datausingIEEE.csv']
-    target = ['y']
+    # dataset = ['syntheticdata.csv']
+    # target = ['y']
+    # dataset = ['VI_4-3']
+    # target = ['None']
+    # dataset = ['101_datausingIEEE.csv']
+    # target = ['y']
     # dataset = ['concrete_data.csv']
     # target = ['concrete_compressive_strength']
-    # dataset = ['boston_housing_data.csv']
-    # target = ['MDEV']
+    dataset = ['boston_housing_data.csv']
+    target = ['MDEV']
     """ energy setting: """
     # dataset = ['energy_data.csv']
     # target = ['Y1']
@@ -180,10 +198,8 @@ def main():
     # target = ['quality']
     # dataset = ['yacht_data.csv']
     # target = ['Y']
-    if dataset == ['101_datausingIEEE.csv']:
-        is_plot = True
-    else:
-        is_plot = False
+    print("当前数据集:   ", dataset[0])
+    is_plot = False
     name = dataset[0].split('.')[0]
     file_path = "E:\\VIcurve\\MTL_PredictionIntervals\\result\\" + name + "\\"
     if not os.path.exists(file_path):
@@ -203,7 +219,7 @@ def main():
             elif dataset == 'yearMSD_data.csv':
                 times = 1
             else:
-                times = 1
+                times = 5
             temp = []
             result_list = []
             name = dataset.split('.')[0]
@@ -246,9 +262,9 @@ def main():
 
 if __name__ == "__main__":
     # 设置迭代次数
-    Run.epochs = 3000
+    Run.epochs = 6000
     # 设置批大小
-    Run.batch_size = 256
+    Run.batch_size = 100
     # 运行主程序
     main()
     # 图片展示

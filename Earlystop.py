@@ -19,7 +19,7 @@ class EarlyStop(keras.callbacks.Callback):
         self.stopped_epoch = 0
         # Initialize the best as infinity.
         self.best_val_loss = np.Inf
-        self.best_coverage = 0.96
+        self.best_coverage = 0.95
         self.best_mpiw_loss = np.Inf
 
     def on_epoch_end(self, epoch, logs=None):
@@ -34,7 +34,7 @@ class EarlyStop(keras.callbacks.Callback):
         if np.less_equal(val_mpiw_loss, self.best_mpiw_loss) and np.greater_equal(val_coverage, self.best_coverage):
             # self.best_val_loss = val_loss
             self.best_mpiw_loss = val_mpiw_loss
-            self.best_coverage = 0.96
+            self.best_coverage = 0.95
             self.wait = 0
             # Record the best weights if current results is better (less).
             self.best_weights = self.model.get_weights()

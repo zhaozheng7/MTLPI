@@ -1,20 +1,39 @@
 import tensorflow as tf
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, minimize
 from tensorflow import keras
 import numpy as np
 from keras import backend as K
 from cagrad import CAGrad
+from PCGrad import PCGrad
 
 
 class PI_Controler(keras.Model):
-    def init_arguments(self, method='normal', coverage_rate=0.95, loss_name="QD"):
+    def init_arguments(self, method, coverage_rate, loss_name):
         self.method = method
         self.coverage_rate = coverage_rate
-        self.lamda = 8
+        self.lamda = 5
         self.loss_name = loss_name
+        """print 当前参数"""
+        print("method:", self.method)
+        print("coverage_rate:", self.coverage_rate)
+        print("loss_name:", self.loss_name)
         # Define selective loss function
 
     def selective_up(self, y_true, y_pred):
+        """
+        Equation 11b, 分为两部分，1/c*求和（（上界-真实值）**2）*ki-------------------1/c*求和（（真实值-下界）**2）*ki
+        用于计算选择性宽度上采样损失
+        首先，根据输入的y_true和y_pred，计算出两个指示符ub_ind和lb_ind。
+        ub_ind表示预测值在真实值之上（即sigmoid(y_pred[:,1] - y_true[:,0]) > 0.5）的指示符。
+        lb_ind表示真实值在预测值之上（即sigmoid(y_true[:,0] - y_pred[:,0]) > 0.5）的指示符。 这两个指示符将用于确定哪些样本应该被用于计算损失。
+        然后，通过将ub_ind和lb_ind相乘，得到一个指示符indicator，该指示符同时满足ub_ind和lb_ind条件的样本。
+        接下来，计算宽度上采样损失width_up_loss，即预测值的第二列与真实值的第一列之间的差的平方。
+        仅计算indicator为真的样本的width_up_loss，通过将indicator与width_up_loss相乘实现。
+        最后，将计算出的width_up_loss进行平均，得到最终的损失值。通过添加K.epsilon()防止除以零
+        :param y_true: 真实值
+        :param y_pred: 预测值，第一列为预测下界，第二列为预测上界
+        :return:上宽度损失
+        """
         ub_ind = K.cast(K.greater(K.sigmoid(y_pred[:, 1] - y_true[:, 0]), 0.5), K.floatx())
         lb_ind = K.cast(K.greater(K.sigmoid(y_true[:, 0] - y_pred[:, 0]), 0.5), K.floatx())
         indicator = tf.multiply(ub_ind, lb_ind)
@@ -26,6 +45,14 @@ class PI_Controler(keras.Model):
         return width_up_loss
 
     def selective_low(self, y_true, y_pred):
+        """
+        Equation 11b 1/c*求和（（真实值-下界）**2）*ki
+        用于计算选择性宽度下采样损失
+        最终的
+        :param y_true:
+        :param y_pred: 预测值，第一列为预测下界，第二列为预测上界
+        :return: 下宽度损失
+        """
         ub_ind = K.cast(K.greater(K.sigmoid(y_pred[:, 1] - y_true[:, 0]), 0.5), K.floatx())
         lb_ind = K.cast(K.greater(K.sigmoid(y_true[:, 0] - y_pred[:, 0]), 0.5), K.floatx())
         indicator = tf.multiply(ub_ind, lb_ind)
@@ -36,17 +63,38 @@ class PI_Controler(keras.Model):
         return width_low_loss
 
     # Upper penalty function (upper_bound >= y_true)
+    # 定义上界惩罚函数（上界>=真实值）equation 11d miss gamma
     def up_penalty(self, y_true, y_pred):
+        """
+        Equation 11d miss gamma
+        该函数用于计算预测值与真实值之间的惩罚损失。其中，y_true为真实标签的tensor，y_pred为预测标签的tensor。
+        函数首先计算y_true的第二列与y_pred的第二列之间的差值，并对差值进行取最大值操作，然后对所有元素求和得到惩罚损失值。最后返回该损失值。
+        :param y_true: 真实值
+        :param y_pred: 预测值，第一列为预测下界，第二列为预测上界
+        :return:覆盖率
+        """
         up_penalty_loss = K.sum(K.maximum([0.0], (y_true[:, 1] - y_pred[:, 1])))
         return up_penalty_loss
 
     # Lower penalty function (lower_bound =< y_true)
     def low_penalty(self, y_true, y_pred):
+        """
+        Equation 11e miss gamma
+        :param y_true:
+        :param y_pred:
+        :return:
+        """
         low_penalty_loss = K.sum(K.maximum([0.0], y_pred[:, 0] - y_true[:, 1]))
         return low_penalty_loss
 
     # Coverage penalty function
     def coverage_penalty(self, y_true, y_pred):
+        """
+        Equation 11f , Calculate the gamma use in up_penalty and low_penalty
+        :param y_true:
+        :param y_pred:
+        :return:gamma use in up_penalty and low_penalty
+        """
         ub_ind = K.cast(K.greater(K.sigmoid(y_pred[:, 1] - y_true[:, 0]), 0.5), K.floatx())
         lb_ind = K.cast(K.greater(K.sigmoid(y_true[:, 0] - y_pred[:, 0]), 0.5), K.floatx())
         coverage_value = K.mean(tf.multiply(ub_ind, lb_ind))
@@ -55,6 +103,12 @@ class PI_Controler(keras.Model):
 
     # Calculate the coverage
     def coverage(self, y_true, y_pred):
+        """
+        Equation 11g
+        :param y_true:
+        :param y_pred:
+        :return:
+        """
         coverage_value = K.cast(K.mean((y_pred[:, 1] >= y_true[:, 0]) & (y_true[:, 0] >= y_pred[:, 0])), K.floatx())
         return coverage_value
 
@@ -75,6 +129,7 @@ class PI_Controler(keras.Model):
         :return: 返回上宽度指标损失
         """
         width_up_loss = K.abs(y_pred[:, 1] - y_true[:, 0])
+        # width_up_loss = K.abs(y_pred[:, 1] - y_pred[:, 2])
         width_up_loss = K.mean(width_up_loss)
         return width_up_loss
 
@@ -86,8 +141,22 @@ class PI_Controler(keras.Model):
         :return: 返回下宽度指标损失
         """
         width_low_loss = K.abs(y_true[:, 0] - y_pred[:, 0])
+        # width_low_loss = K.abs(y_pred[:, 2] - y_pred[:, 0])
         width_low_loss = K.mean(width_low_loss)
         return width_low_loss
+
+    def abs_mpiw(self, y_true, y_pred):
+        """
+        分步计算
+        :param y_true: 真实值
+        :param y_pred: 预测值，0下界，1上界
+        :return: 返回MPIW指标损失
+        """
+        width_up_loss = K.abs(y_pred[:, 1] - y_true[:, 0])
+        width_up_loss = K.mean(width_up_loss)
+        width_low_loss = K.abs(y_true[:, 0] - y_pred[:, 0])
+        width_low_loss = K.mean(width_low_loss)
+        return width_up_loss + width_low_loss
 
     def abs_ki_selective_up(self, y_true, y_pred):
         ub_ind = K.cast(K.greater(K.sigmoid(y_pred[:, 1] - y_true[:, 0]), 0.5), K.floatx())
@@ -109,6 +178,51 @@ class PI_Controler(keras.Model):
         width_low_loss = tf.math.multiply(indicator, width_low_loss)
         width_low_loss = (K.sum(width_low_loss) + K.epsilon()) / (K.sum(indicator) + K.epsilon())
         return width_low_loss
+
+    def abs_rmpiw_loss(self, y_true, y_pred):
+        """
+        使用rmpiw进行宽度损失函数构造
+        :param y_true:
+        :param y_pred:
+        :return:
+        """
+        width_up_loss = K.abs(y_pred[:, 1] - y_true[:, 0])
+        width_up_loss = K.mean(width_up_loss)
+        width_low_loss = K.abs(y_true[:, 0] - y_pred[:, 0])
+        width_low_loss = K.mean(width_low_loss)
+        r = K.max(y_true[:, 0]) - K.min(y_true[:, 0])
+        return (width_up_loss + width_low_loss) / r
+
+    def dual_picp(self, y_true, y_pred):
+        """
+        使用dual论文中的picp计算方法
+        :param y_true:
+        :param y_pred:
+        :return:
+        """
+        y_l = y_pred[:, 0]
+        y_u = y_pred[:, 1]
+        y_o = y_pred[:, 2]
+        picp_now = K.cast(K.mean((y_pred[:, 1] >= y_true[:, 0]) & (y_true[:, 0] >= y_pred[:, 0])), K.floatx())
+        c = self.coverage_rate - picp_now
+        eta_ = c * 0.001
+        cs = tf.math.reduce_max(tf.abs(y_o - y_true[:, 2]))  # cs 为点估计和真实值差距最大的地方
+        Constraints = K.exp(K.abs(K.mean(-y_u + y_true[:, 2]) + cs)) + K.exp(K.abs(K.mean(-y_true[:, 2] + y_l) + cs))
+        return eta_ * Constraints
+
+    def picp_term(self, y_true, y_pred):
+        """
+        计算PICP的正则项
+        :param y_true: 真实值
+        :param y_pred: 预测值，0下界，1上界
+        :return: PICP的term
+        """
+        picp_now = tf.reduce_mean(tf.cast(
+            tf.logical_and(tf.less_equal(y_pred[:, 0], y_pred[:, 2]), tf.less_equal(y_pred[:, 2], y_pred[:, 1])),
+            tf.float32))
+        constraint_loss = 8888 * tf.maximum(0.0, self.coverage_rate - picp_now)
+        loss_picp = K.sum(K.maximum([0.0], (y_true[:, 1] - y_pred[:, 1])))
+        return constraint_loss
 
     def mse_penalty(self, y_true, y_pred):
         """
@@ -145,15 +259,17 @@ class PI_Controler(keras.Model):
         :return:
         """
         # calculate the coverage
-        yita = 0.01
+        yita = 0.001
 
-        picp_now = K.cast(K.mean((y_pred[:, 1] >= y_true[:, 0]) & (y_true[:, 0] >= y_pred[:, 0])), K.floatx())
+        picp_now = tf.logical_and(tf.less_equal(y_pred[:, 0], y_pred[:, 2]), tf.less_equal(y_pred[:, 2], y_pred[:, 1]))
+        picp_now=tf.reduce_mean(tf.cast(picp_now, tf.float32))
         c = self.coverage_rate - picp_now
 
         return yita * c
 
     def calculate_piad(self, y_true, y_pred):
         """
+        暂时用不到
         计算偏差信息
         :param y_true:真实值
         :param y_pred:预测值
@@ -168,24 +284,29 @@ class PI_Controler(keras.Model):
         l_piad = K.sum(piad)
         return l_piad
 
-    def dual_loss(self, y_true, y_pred):
+    def dual_loss(self, y_true, y_pred, C):
         """
         loss from 2024 dual paper
         :param y_true:0下界，1上界，2预测值
         :param y_pred:0下界，1上界，2预测值
         :return:
         """
-        y_l = y_pred[:, 0]
-        y_u = y_pred[:, 1]
-        y_o = y_pred[:, 2]
-        picp_now = K.cast(K.mean((y_pred[:, 1] >= y_true[:, 0]) & (y_true[:, 0] >= y_pred[:, 0])), K.floatx())
-        c = self.coverage_rate - picp_now
-        eta_ = c * 0.01
-        cs = tf.math.reduce_max(tf.abs(y_o - y_true[:, 2]))  # cs 为点估计和真实值差距最大的地方
+        y_l = y_pred[:, 0]  # 下界
+        y_u = y_pred[:, 1]  # 上界
+        y_o = y_pred[:, 2]  # 预测值
+        y_true = y_true[:, 0]  # 真实值()
+        beta_ = [1+C, 0.99]
+        lambda1, lambda2 = beta_
+        MSE = K.mean((y_o - y_true) ** 2)  # Calculate MSE
+        # cs = tf.math.reduce_max(tf.abs(y_o - y_true))  # cs 为点估计和真实值差距最大的地方
         # DualAQD reported in the paper // torch.clamp的作用是若第一个参数小于第二个参数，则返回第二个参数，否则返回第一个参数
-        MPIW_p = K.mean(K.abs(y_u - y_true[:, 2]) + K.abs(y_true[:, 2] - y_l))  # Calculate MPIW_penalty
-        Constraints = K.exp(K.abs(K.mean(-y_u + y_true[:, 2]) + cs)) + K.exp(K.abs(K.mean(-y_true[:, 2] + y_l) + cs))
-        return MPIW_p + Constraints * eta_
+        MPIW_p = K.mean(K.abs(y_u - y_o) + K.abs(y_o - y_l))  # Calculate MPIW_penalty
+        Constraints = (
+                    K.exp(K.mean(-y_u + y_o) + K.max(K.abs(y_o - y_true))) +
+                    K.exp(K.mean(-y_o + y_l) + K.max(K.abs(y_o - y_true))) +
+                    K.exp(K.mean(-y_u + y_l))
+        )
+        return MPIW_p + lambda1 * Constraints + lambda2 * MSE
 
     def qd_loss(self, y_true, y_pred):
         """
@@ -195,11 +316,12 @@ class PI_Controler(keras.Model):
         :return:
         """
         # hyperparameters
-        lambda_ = 0.01  # lambda in loss fn
-        alpha_ = 1 - self.coverage_rate  # capturing (1-alpha)% of samples
+        # set to 4.0 for naval, 40.0 for protein, 30.0 for wine, and 6.0 for yacht
+        lambda_ = 40.  # lambda in loss fn
+        alpha_ = 1. - self.coverage_rate  # capturing (1-alpha)% of samples
         soften_ = 160.
         n_ = 100  # batch size
-        y_true = y_true[:, 0]
+        y_true = y_true[:, 2]
         y_l = y_pred[:, 0]
         y_u = y_pred[:, 1]
         K_HU = tf.maximum(0., tf.sign(y_u - y_true))
@@ -211,7 +333,7 @@ class PI_Controler(keras.Model):
         MPIW_c = tf.reduce_sum(tf.multiply((y_u - y_l), K_H)) / tf.reduce_sum(K_H)
         PICP_H = tf.reduce_mean(K_H)
         PICP_S = tf.reduce_mean(K_S)
-        Loss_S = MPIW_c + lambda_ * n_ / (alpha_ * (1 - alpha_)) * tf.maximum(0., (1 - alpha_) - PICP_S)
+        Loss_S = MPIW_c + lambda_ * 10 / (alpha_ * (1 - alpha_)) * (tf.maximum(0., (1 - alpha_) - PICP_S))
         return Loss_S
 
     def qd_plus_loss(self, y_true, y_pred):
@@ -226,10 +348,10 @@ class PI_Controler(keras.Model):
         y_u = y_pred[:, 1]
         y_o = y_pred[:, 2]
         # Separate hyperparameters
-        beta_ = [0.5, 0.5]
+        beta_ = [0.9974, 0.51]
         lambda_1, lambda_2 = beta_
         ksi = 10  # According to the QD+ paper
-        soften_ = 10
+        soften_ = 160.
         MSE = K.mean((y_o - y_true) ** 2)  # Calculate MSE
         alpha_ = 1 - self.coverage_rate
         # Calculate soft captured vector, MPIW, and PICP
@@ -243,7 +365,7 @@ class PI_Controler(keras.Model):
         Lp = K.mean((K.relu(y_l - y_o)) + (K.relu(y_o - y_u)))
         # Calculate loss (Eq. 12 QD+ paper)
         Loss_S = (1 - lambda_1) * (1 - lambda_2) * MPIW_c + lambda_1 * (
-                    1 - lambda_2) * L_PICP + lambda_2 * MSE + ksi * Lp
+                1 - lambda_2) * L_PICP + lambda_2 * MSE + ksi * Lp
         return Loss_S
 
     #   @article{yu2020gradient,
@@ -287,7 +409,7 @@ class PI_Controler(keras.Model):
                 start_idx += flatten_dim
 
         grads_and_vars = zip(proj_grads, self.trainable_variables)
-        return proj_grads
+        return grads_and_vars
 
     def cagrad(self, loss, c=0.5):
         assert type(loss) is list
@@ -348,9 +470,13 @@ class PI_Controler(keras.Model):
         qd_plus_loss = self.qd_plus_loss(y, y_pred)
         mse_loss = self.mse_penalty(y, y_pred)  # 用于点估计
         C = self.adaptive_hyper(y, y_pred)  # 自适应lambda值
-        dual_loss = self.dual_loss(y, y_pred)  # 2024年IEEE论文
+        dual_loss = self.dual_loss(y, y_pred, C)  # 2024年IEEE论文
         abs_ki_width_up = self.abs_ki_selective_up(y, y_pred)  # 加入ki的绝对值
         abs_ki_width_low = self.abs_ki_selective_low(y, y_pred)  # 加入ki的绝对值
+        abs_mpiw = self.abs_mpiw(y, y_pred)  # 绝对值mpiw，原基础上合并
+        picp_loss = self.picp_term(y, y_pred)  # picp正则项
+        rmpiw_loss = self.abs_rmpiw_loss(y, y_pred)  # rmpiw
+        dual_picp = self.dual_picp(y, y_pred)  # dual论文的PICP部分
         # Calculate the metrics
         coverage_value = self.coverage(y, y_pred)
         mpiw_value = self.mpiw(y, y_pred)
@@ -365,20 +491,26 @@ class PI_Controler(keras.Model):
             #         coverage_penalty * K.mean(up_penalty_loss)) + 1 / 5 * (
             #                coverage_penalty * K.mean(low_penalty_loss))+1/5*mse_loss
             if self.loss_name == 'QD':
-                loss = 1 / 2 * qd_loss + 1 / 2 * mse_loss
-            if self.loss_name == 'QD+':
+                loss = 1/2*qd_loss + 1/2*mse_loss
+            elif self.loss_name == 'QD+':
+                """use QD+ loss by snm paper, and it includes mse loss"""
                 loss = qd_plus_loss
-            if self.loss_name == 'Continuous':
+            elif self.loss_name == 'Continuous':
                 """use Continuous paper without change"""
-                loss = 1 / 5 * K.mean(width_up_loss) + 1 / 5 * K.mean(width_low_loss) + 1 / 5 * (
-                        coverage_penalty * K.mean(up_penalty_loss)) + 1 / 5 * (
-                               coverage_penalty * K.mean(low_penalty_loss)) + 1 / 5 * mse_loss
-            if self.loss_name == 'Dual':
+                loss = 1 / 3 * (K.mean(width_up_loss) + K.mean(width_low_loss)) \
+                       + 1 / 3 * coverage_penalty * (K.mean(up_penalty_loss) + K.mean(low_penalty_loss)) \
+                       + 1 / 3 * mse_loss
+            elif self.loss_name == 'Dual':
                 """use dual paper loss"""
-                loss = 1 / 2 + dual_loss + 1 / 2 * mse_loss
-            if self.loss_name == 'MTLPI':
-                loss = 1 / 3 * K.mean(abs_width_low_loss) + 1 / 3 * K.mean(abs_width_up_loss) + 1 / 3 * (1 + C) * (
-                        K.mean(up_penalty_loss) + K.mean(low_penalty_loss)) + 1 / 3 * (mse_loss)
+                loss = dual_loss
+            elif self.loss_name == 'MTLPI':
+                loss = abs_mpiw \
+                       + (1+C) * (K.mean(up_penalty_loss + low_penalty_loss))  \
+                       + (1+C) * mse_loss
+            elif self.loss_name == 'RMTLPI':
+                loss = 1 / 3 * abs_mpiw \
+                       + 1 / 3 * (K.mean(up_penalty_loss + low_penalty_loss)) * (1+C) \
+                       + 1 / 3 * mse_loss
             """use abs width loss without ki and picp has adaptive hyper"""
             # loss = 1 / 5 * abs_width_up_loss + 1 / 5 * abs_width_low_loss + 1 / 5 * (
             #         (1+C) * K.mean(up_penalty_loss)) + 1 / 5 * (
@@ -393,19 +525,18 @@ class PI_Controler(keras.Model):
             #                coverage_penalty * K.mean(low_penalty_loss))+ 1 / 5 * mse_loss
             gradients = tf.gradients(loss, trainable_vars)
 
-        if self.method == 'CAGrad':
-            loss = [K.mean(abs_width_low_loss) + K.mean(abs_width_up_loss),
-                    K.mean(up_penalty_loss) + K.mean(low_penalty_loss)]
-            cagrad = self.cagrad(loss)
-            gradients = cagrad(loss)
-        # To debug
-        # tf.print(' Width_Loss:', width_up_loss+width_low_loss,
-        #     ' Penalty_Loss:', up_penalty_loss+low_penalty_loss,
-        #     ' Coverage_penalty_Loss:', coverage_penalty,
-        #     'Sum Loss:', width_up_loss+width_low_loss+coverage_penalty*up_penalty_loss+coverage_penalty*low_penalty_loss)
+        elif self.method == 'PCGrad':
+            loss = [K.mean(width_up_loss) + K.mean(width_low_loss),
+                    (K.mean(up_penalty_loss) + K.mean(low_penalty_loss)) * K.mean(coverage_penalty) + K.epsilon(),
+                    mse_loss + K.epsilon()]
+            computegrad = self.compute_gradients_by_PCG(loss)
 
         # Update weights
-        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        if self.method == 'normal':
+            self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        elif self.method == 'PCGrad':
+            self.optimizer.apply_gradients(computegrad)
+
         # Update metrics (includes the metric that tracks the loss)
         self.compiled_metrics.update_state(y, y_pred)
         # Return a dict mapping metric names to current value
